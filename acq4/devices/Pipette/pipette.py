@@ -1,15 +1,13 @@
+import json
+import numpy as np
 import weakref
 from typing import List
 
-import numpy as np
 import pyqtgraph as pg
-from six.moves import range
-import json
-
 from acq4 import getManager
 from acq4.devices.Device import Device
 from acq4.devices.OptomechDevice import OptomechDevice
-from acq4.devices.Stage import Stage
+from acq4.devices.Stage import Stage, MovePathFuture
 from acq4.modules.Camera import CameraModuleInterface
 from acq4.util import Qt, ptime
 from acq4.util.target import Target
@@ -17,6 +15,8 @@ from pyqtgraph import Point
 from .planners import defaultMotionPlanners, PipettePathGenerator
 from .tracker import PipetteTracker
 from ..RecordingChamber import RecordingChamber
+from ...util.HelpfulException import HelpfulException
+from ...util.future import Future
 
 CamModTemplate = Qt.importTemplate('.cameraModTemplate')
 
@@ -135,7 +135,7 @@ class Pipette(Device, OptomechDevice):
 
         deviceManager.sigAbortAll.connect(self.stop)
 
-    def moveTo(self, position, speed, raiseErrors=False, **kwds):
+    def moveTo(self, position: str, speed, raiseErrors=False, **kwds):
         """Move the pipette tip to a named position, with safe motion planning.
 
         If *raiseErrors* is True, then an exception will be raised in a background
@@ -143,9 +143,13 @@ class Pipette(Device, OptomechDevice):
         """
         # Select a motion planner based on the target position
         plannerClass = self.motionPlanners.get(position, self.defaultMotionPlanners.get(position, None))
+        if plannerClass is None:
+            savedPos = self.loadPosition(position)
+            if savedPos is not None:
+                plannerClass = self.motionPlanners.get('saved', self.defaultMotionPlanners.get('saved', None))
 
         if plannerClass is None:
-            raise ValueError("Unknown pipette move position %r" % position)
+            raise ValueError(f"Unknown pipette move position {position!r}")
 
         if self.currentMotionPlanner is not None:
             self.currentMotionPlanner.stop()
@@ -153,7 +157,7 @@ class Pipette(Device, OptomechDevice):
         self.currentMotionPlanner = plannerClass(self, position, speed, **kwds)
         future = self.currentMotionPlanner.move()
         if raiseErrors is not False:
-            future.raiseErrors(message="Move to " + position + " position failed; requested from:\n{stack}")
+            future.raiseErrors(message=f"Move to {position} position failed; requested from:\n{{stack}}")
 
         return future
 
@@ -168,12 +172,44 @@ class Pipette(Device, OptomechDevice):
         cache = self.readConfigFile('stored_positions')
         cache[name] = list(pos)
         self.writeConfigFile(cache, 'stored_positions')
+        self.checkRangeOfMotion(pos)
 
     def loadPosition(self, name, default=None):
         """Return a previously saved position.
         """
         cache = self.readConfigFile('stored_positions')
         return cache.get(name, default)
+
+    def checkRangeOfMotion(self, pos, tolerance=500e-6):
+        """Warn user if the position (in global coordinates) is within 500µm of the manipulator's range of motion."""
+        manipulator: Stage = self.parentDevice()
+
+        def posToDeviceInternal(p):
+            p = self._solveGlobalStagePosition(p)
+            return manipulator.mapGlobalToDevicePosition(p)
+        pos = np.array(pos)
+        bad_axes = []
+        for axis in (0, 1, 2):
+            try:
+                bound = pos[:]
+                bound[axis] -= tolerance
+                manipulator.checkLimits(posToDeviceInternal(bound))
+                bound[axis] += 2 * tolerance
+                manipulator.checkLimits(posToDeviceInternal(bound))
+            except ValueError:
+                bad_axes.append(axis)
+        if bad_axes:
+            axis_names = {0: 'x', 1: 'y', 2: 'z'}
+            axes = ', '.join(axis_names[axis] for axis in bad_axes)
+            pos = posToDeviceInternal(pos)
+            raise HelpfulException(
+                f"The specified position is within ±{tolerance:g}m of the {axes} limit(s) of this manipulator "
+                f"and may not always be accessible, depending on your pipette pull consistency.",
+                reasons=[
+                    f"Manipulator limits: {manipulator.getLimits()}",
+                    f"Position: ({pos[0]:f}, {pos[1]:f}, {pos[2]:f})",
+                ],
+            )
 
     def scopeDevice(self):
         if self._scopeDev is None:
@@ -274,7 +310,7 @@ class Pipette(Device, OptomechDevice):
             # for backward compatibility
             if self._calibratedYaw is not None:
                 return self._calibratedYaw
-            raise Exception(f"Yaw angle is not configured for {self.name()}")
+            raise ValueError(f"Yaw angle is not configured for {self.name()}")
         if self.config['yaw'] == 'auto':
             return self._manipulatorOrientation()['yaw']
         else:
@@ -289,7 +325,7 @@ class Pipette(Device, OptomechDevice):
             # for backward compatibility
             if self._calibratedPitch is not None:
                 return self._calibratedPitch
-            raise Exception(f"Pitch angle is not configured for {self.name()}")
+            raise ValueError(f"Pitch angle is not configured for {self.name()}")
         if self.config['pitch'] == 'auto':
             return self._manipulatorOrientation()['pitch']
         else:
@@ -328,15 +364,19 @@ class Pipette(Device, OptomechDevice):
     def goAboveTarget(self, speed, **kwds):
         return self.moveTo('aboveTarget', speed=speed, **kwds)
 
-    def _movePath(self, path):
-        # move along a path defined in global coordinates. 
-        # Format is [(pos, speed, linear), ...]
-        # returns the movefuture of the last move.
+    def _movePath(self, path) -> MovePathFuture:
+        """
+        move along a path defined in global coordinates.
+        Format is [(pos, speed, linear, explanation), ...]
+        returns the movefuture of the last move.
+        WARNING: This method does _not_ implement any motion planning.
+        """
+
         self.sigMoveRequested.emit(self, path[-1][0], None, {'path': path})
         stagePath = []
-        for pos, speed, linear in path:
+        for pos, speed, linear, explanation in path:
             stagePos = self._solveGlobalStagePosition(pos)
-            stagePath.append({'globalPos': stagePos, 'speed': speed, 'linear': linear})
+            stagePath.append({'globalPos': stagePos, 'speed': speed, 'linear': linear, 'explanation': explanation})
 
         stage = self.parentDevice()
         return stage.movePath(stagePath)
@@ -349,7 +389,7 @@ class Pipette(Device, OptomechDevice):
         scope = self.scopeDevice()
         surface = scope.getSurfaceDepth()
         if surface is None:
-            raise Exception("Surface depth has not been set.")
+            raise ValueError("Surface depth has not been set.")
         return surface + self._opts['approachHeight']
 
     def depthBelowSurface(self):
@@ -406,6 +446,26 @@ class Pipette(Device, OptomechDevice):
         if depth < appDepth:
             return self.advance(appDepth, speed=speed)
 
+    @Future.wrap
+    def stepwiseAdvance(self, depth: float, maxSpeed: float = 10e-6, interval: float = 5, _future=None):
+        """Retract in 1µm steps, allowing for manual user movements"""
+        initial_direction = None
+        while True:
+            pos = self.globalPosition()
+            goal = self.positionAtDepth(depth)
+            direction = goal - pos
+            if initial_direction is None:
+                initial_direction = np.sign(direction[2])
+            if np.sign(direction[2]) != initial_direction:
+                break  # overshot
+            delta = 1e-6
+            distance = np.linalg.norm(direction)
+            step = pos + delta * direction / distance
+            _future.waitFor(self._moveToGlobal(step, speed=maxSpeed, linear=True))
+            if distance <= delta:
+                break
+            _future.sleep(interval)
+
     def globalPosition(self):
         """Return the position of the electrode tip in global coordinates.
 
@@ -415,15 +475,15 @@ class Pipette(Device, OptomechDevice):
 
     def _moveToGlobal(self, pos, speed, **kwds):
         """Move the electrode tip directly to the given position in global coordinates.
-        This method does _not_ implement any motion planning.
+        WARNING: This method does _not_ implement any motion planning.
         """
         self.sigMoveRequested.emit(self, pos, speed, kwds)
         stagePos = self._solveGlobalStagePosition(pos)
         stage = self.parentDevice()
         try:
             return stage.moveToGlobal(stagePos, speed, **kwds)
-        except Exception as exc:
-            print("Error moving %s to global position %r:" % (self, pos))
+        except Exception:
+            print(f"Error moving {self} to global position {pos!r}:")
             raise
 
     def _solveGlobalStagePosition(self, pos):
@@ -436,7 +496,7 @@ class Pipette(Device, OptomechDevice):
 
     def _moveToLocal(self, pos, speed, linear=False):
         """Move the electrode tip directly to the given position in local coordinates.
-        This method does _not_ implement any motion planning.
+        WARNING: This method does _not_ implement any motion planning.
         """
         return self._moveToGlobal(self.mapToGlobal(pos), speed, linear=linear)
 
@@ -447,7 +507,7 @@ class Pipette(Device, OptomechDevice):
 
     def targetPosition(self):
         if self.target is None:
-            raise RuntimeError("No target defined for %s" % self.name())
+            raise RuntimeError(f"No target defined for {self.name()}")
         return self.target
 
     def hideMarkers(self, hide):
@@ -533,7 +593,7 @@ class PipetteRecorder:
         self.pip.sigMoveRequested.disconnect(self.recordMoveRequested)
 
     def store(self, filename):
-        json.dump(self.events, open(filename + '.json', 'w'))
+        json.dump(self.events, open(f'{filename}.json', 'w'))
 
 
 class PipetteCamModInterface(CameraModuleInterface):
@@ -543,7 +603,7 @@ class PipetteCamModInterface(CameraModuleInterface):
     """
     canImage = False
 
-    def __init__(self, dev, mod, showUi=True):
+    def __init__(self, dev: "Pipette", mod, showUi=True):
         CameraModuleInterface.__init__(self, dev, mod)
         self._haveTarget = False
         self._showUi = showUi
@@ -856,10 +916,10 @@ class Axis(pg.ROI):
         p.scale(w, h)
         p.drawPath(self._path)
 
-    def setAngle(self, angle, update=True):
+    def setAngle(self, angle, update=True, **kwds):
         if self.state['angle'] == angle:
             return
-        pg.ROI.setAngle(self, angle, update=update)
+        pg.ROI.setAngle(self, angle, update=update, **kwds)
 
 
 class PipetteDeviceGui(Qt.QWidget):
@@ -884,4 +944,4 @@ class PipetteDeviceGui(Qt.QWidget):
     def pipetteMoved(self):
         pos = self.dev.globalPosition()
         for i in range(3):
-            self.posLabels[i].setText("%0.3g um" % (pos[i] * 1e6))
+            self.posLabels[i].setText("%0.3f mm" % (pos[i] * 1e3))

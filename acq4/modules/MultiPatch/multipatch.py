@@ -13,6 +13,7 @@ from acq4.util import Qt, ptime
 from .mockPatch import MockPatch
 from .pipetteControl import PipetteControl
 from ...devices.PatchPipette.statemanager import PatchPipetteStateManager
+from ...util.json_encoder import ACQ4JSONEncoder
 
 Ui_MultiPatch = Qt.importTemplate('.multipatchTemplate')
 
@@ -47,6 +48,7 @@ class MultiPatchWindow(Qt.QWidget):
         self._calibratePips = []
         self._calibrateStagePositions = []
         self._setTargetPips = []
+        self._profileEditor = None
 
         Qt.QWidget.__init__(self)
         self.module = module
@@ -78,7 +80,7 @@ class MultiPatchWindow(Qt.QWidget):
             pip.sigMoveFinished.connect(self.pipetteMoveFinished)
             if isinstance(pip, PatchPipette):
                 pip.sigNewEvent.connect(self.pipetteEvent)
-                pip.sigTestPulseEnabled.connect(self.pipetteTestPulseEnabled)
+                pip.clampDevice.sigTestPulseEnabled.connect(self.pipetteTestPulseEnabled)
             ctrl = PipetteControl(pip, self)
             if i > 0:
                 ctrl.hideHeader()
@@ -109,6 +111,7 @@ class MultiPatchWindow(Qt.QWidget):
             self.ui.profileCombo.addItem(profile)
 
         self.ui.profileCombo.currentIndexChanged.connect(self.profileComboChanged)
+        self.ui.editProfileBtn.clicked.connect(self.openProfileEditor)
         # self.ui.stepSizeSpin.setOpts(value=10e-6, suffix='m', siPrefix=True, bounds=[5e-6, None], step=5e-6)
         self.ui.calibrateBtn.toggled.connect(self.calibrateToggled)
         self.ui.setTargetBtn.toggled.connect(self.setTargetToggled)
@@ -125,7 +128,9 @@ class MultiPatchWindow(Qt.QWidget):
         self.ui.fineSearchBtn.clicked.connect(self.fineSearch)
         self.ui.hideMarkersBtn.toggled.connect(self.hideBtnToggled)
         self.ui.cellDetectBtn.clicked.connect(self.cellDetectClicked)
-        self.ui.sealBtn.clicked.connect(self.sealClicked)
+        self.ui.sealBtn.clicked.connect(self.sealClicked)   
+        self.ui.collectBtn.clicked.connect(self.collectClicked)
+        self.ui.nucleusHomeBtn.clicked.connect(self.nucleusHomeClicked)
         self.ui.breakInBtn.clicked.connect(self.breakInClicked)
         self.ui.reSealBtn.clicked.connect(self.reSealClicked)
         self.ui.cleanBtn.clicked.connect(self.cleanClicked)
@@ -194,6 +199,14 @@ class MultiPatchWindow(Qt.QWidget):
         for pip in self.pips:
             pip.stateManager().setProfile(profile)
 
+    def openProfileEditor(self):
+        if self._profileEditor is None or not self._profileEditor.isVisible():
+            from .patchProfileEditor import ProfileEditor
+            self._profileEditor = ProfileEditor()
+            self._profileEditor.show()
+        else:
+            self._profileEditor.setTopLevelWindow()
+
     def setPlotModes(self, modes):
         for ctrl in self.pipCtrls:
             ctrl.setPlotModes(modes)
@@ -230,12 +243,12 @@ class MultiPatchWindow(Qt.QWidget):
                 pip = pip.pipetteDevice
             pip.goHome(speed, raiseErrors=True)
 
-    def moveIdle(self):
-        speed = self.selectedSpeed(default='fast')
-        for pip in self.selectedPipettes():
-            if isinstance(pip, PatchPipette):
-                pip = pip.pipetteDevice
-            pip.goIdle(speed, raiseErrors=True)
+    # def moveIdle(self):
+    #     speed = self.selectedSpeed(default='fast')
+    #     for pip in self.selectedPipettes():
+    #         if isinstance(pip, PatchPipette):
+    #             pip = pip.pipetteDevice
+    #         pip.goIdle(speed, raiseErrors=True)
 
     def selectedSpeed(self, default):
         if self.ui.fastBtn.isChecked():
@@ -357,12 +370,12 @@ class MultiPatchWindow(Qt.QWidget):
                 pip = pip.pipetteDevice
             pip.hideMarkers(hide)
 
-    def pipetteTestPulseEnabled(self, pip, enabled):
+    def pipetteTestPulseEnabled(self, clamp, enabled):
         self.updateSelectedPipControls()
 
     # def testPulseClicked(self):
     #     for pip in self.selectedPipettes():
-    #         pip.enableTestPulse(self.ui.testPulseBtn.isChecked())
+    #         pip.clampDevice.enableTestPulse(self.ui.testPulseBtn.isChecked())
 
     def pipetteActiveChanged(self, active):
         self.selectionChanged()
@@ -392,12 +405,12 @@ class MultiPatchWindow(Qt.QWidget):
             self.ui.selectedGroupBox.setEnabled(False)
         else:
             if solo:
-                self.ui.selectedGroupBox.setTitle("Selected: %s" % (pips[0].name()))
+                self.ui.selectedGroupBox.setTitle(f"Selected: {pips[0].name()}")
             elif len(pips) > 1:
                 self.ui.selectedGroupBox.setTitle("Selected: multiple")
             self.ui.selectedGroupBox.setEnabled(True)
             self.updateSelectedPipControls()
-        
+
         self.updateXKeysBacklight()
 
     def updateSelectedPipControls(self):
@@ -442,16 +455,16 @@ class MultiPatchWindow(Qt.QWidget):
         self.xkdev.setBacklights(bl, axis=1)
 
     def xkeysStateChanged(self, dev, changes):
-        for k,v in changes.items():
+        actions = {0: 'activeBtn', 1: 'lockBtn', 2: 'selectBtn', 3: 'tipBtn', 4: 'targetBtn'}
+        for k, v in changes.items():
             if k == 'keys':
                 for key, state in v:
-                    if state is True:
+                    if state:
                         if key[1] > 3:
-                            row = key[0]
                             col = key[1] - 4
                             if col >= len(self.pips):
                                 continue
-                            actions = {0:'activeBtn', 1:'lockBtn', 2:'selectBtn', 3:'tipBtn', 4:'targetBtn'}
+                            row = key[0]
                             if row in actions:
                                 btnName = actions[row]
                                 btn = getattr(self.pipCtrls[col].ui, btnName)
@@ -488,6 +501,18 @@ class MultiPatchWindow(Qt.QWidget):
         for pip in pips:
             if isinstance(pip, PatchPipette):
                 pip.setState('seal')
+
+    def collectClicked(self):
+        pips = self.selectedPipettes()
+        for pip in pips:
+            if isinstance(pip, PatchPipette):
+                pip.setState('collect')
+
+    def nucleusHomeClicked(self):
+        pips = self.selectedPipettes()
+        for pip in pips:
+            if isinstance(pip, PatchPipette):
+                pip.setState('home with nucleus')
 
     def breakInClicked(self):
         pips = self.selectedPipettes()
@@ -549,11 +574,11 @@ class MultiPatchWindow(Qt.QWidget):
     def resetHistory(self):
         self.eventHistory = []
         for pip in self.selectedPipettes():
-            pip.resetTestPulseHistory()
+            pip.clampDevice.resetTestPulseHistory()
 
     def writeRecords(self, recs):
         if self.storageFile is None:
             return
         for rec in recs:
-            self.storageFile.write(json.dumps(rec).encode("utf8") + b",\n")
+            self.storageFile.write(json.dumps(rec, cls=ACQ4JSONEncoder).encode("utf8") + b",\n")
         self.storageFile.flush()

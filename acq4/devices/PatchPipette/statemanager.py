@@ -1,14 +1,13 @@
-from __future__ import print_function
-
-import sys
+import queue
 from collections import OrderedDict
 
-from six.moves import queue
+import sys
+from typing import Optional
 
 from acq4 import getManager
 from acq4.util import Qt
-from pyqtgraph import disconnect
 from acq4.util.debug import printExc
+from pyqtgraph import disconnect
 from . import states
 
 
@@ -30,19 +29,21 @@ class PatchPipetteStateManager(Qt.QObject):
         [
             (state.stateName, state)
             for state in [
-                states.PatchPipetteOutState,
-                states.PatchPipetteBathState,
-                states.PatchPipetteApproachState,
-                states.PatchPipetteCellDetectState,
-                states.PatchPipetteSealState,
-                states.PatchPipetteCellAttachedState,
-                states.PatchPipetteBreakInState,
-                states.PatchPipetteWholeCellState,
-                states.PatchPipetteResealState,
-                states.PatchPipetteBlowoutState,
-                states.PatchPipetteBrokenState,
-                states.PatchPipetteFouledState,
-                states.PatchPipetteCleanState,
+                states.OutState,
+                states.BathState,
+                states.ApproachState,
+                states.CellDetectState,
+                states.SealState,
+                states.CellAttachedState,
+                states.BreakInState,
+                states.WholeCellState,
+                states.ResealState,
+                states.BlowoutState,
+                states.BrokenState,
+                states.FouledState,
+                states.CleanState,
+                states.NucleusCollectState,
+                states.MoveNucleusToHomeState,
             ]
         ]
     )
@@ -51,7 +52,7 @@ class PatchPipetteStateManager(Qt.QObject):
     _sigStateChangeRequested = Qt.Signal(object, object)  # state, return queue
     sigProfileChanged = Qt.Signal(object, object)  # self, profile_name
 
-    profiles = {}
+    profiles: dict[str: dict[str: dict[str: object]]] = {}  # {profile_name: {state_name: {config_options}}}
     _profilesLoadedFromConfig = False
 
     def __init__(self, dev):
@@ -60,9 +61,7 @@ class PatchPipetteStateManager(Qt.QObject):
         self.dev.sigStateChanged.connect(self.stateChanged)
         self.dev.sigActiveChanged.connect(self.activeChanged)
         self.currentJob = None
-
-        # default state configuration parameters
-        self.stateConfig = {}  # {state: {config options}}
+        self._profile = None
 
         self._sigStateChangeRequested.connect(self._stateChangeRequested)
 
@@ -75,8 +74,18 @@ class PatchPipetteStateManager(Qt.QObject):
         return list(cls.profiles.keys())
 
     @classmethod
-    def _getProfileConfig(cls, name):
+    def listStates(cls):
+        return list(cls.stateHandlers.keys())
+
+    @classmethod
+    def getStateClass(cls, name) -> states.PatchPipetteState:
+        return cls.stateHandlers[name]
+
+    @classmethod
+    def getProfileConfig(cls, name):
         cls._loadGlobalProfilesOnce()
+        if name not in cls.profiles:
+            raise KeyError(f"Unknown patch profile {name}")
         return cls.profiles[name]
 
     @classmethod
@@ -87,42 +96,42 @@ class PatchPipetteStateManager(Qt.QObject):
         man = getManager()
         for k,v in man.config.get('misc', {}).get('patchProfiles', {}).items():
             v = v.copy()
-            copyFrom = v.pop('copyFrom', None)
-            cls.addProfile(name=k, config=v, copyFrom=copyFrom)
+            cls.addProfile(name=k, config=v)
 
     @classmethod
-    def addProfile(cls, name, config, copyFrom=None, overwrite=False):
+    def addProfile(cls, name: str, config: dict, overwrite=False):
         assert overwrite or name not in cls.profiles, f"Patch profile {name} already exists"
-        if copyFrom is not None:
-            # mix defaults in with selected profile
-            assert copyFrom in cls.profiles, f"Patch profile {copyFrom} does not exist (requested by {name})"
-            default = cls.profiles[copyFrom]
-            p = {}
-            for k in set(list(default.keys()) + list(config.keys())):
-                p[k] = default.get(k, {}).copy()
-                p[k].update(config.get(k, {}))
-            config = p
         cls.profiles[name] = config
 
-    def setProfile(self, profile):
-        profile = self._getProfileConfig(profile)
-        self.setStateConfig(profile, profileName=profile)
+    @classmethod
+    def getStateConfig(cls, state: str, profile: Optional[str]):
+        """
+        Return the configuration options for the given state and profile, or just the defaults if no profile is
+        specified.
+        """
+        if profile is None:
+            config = {}
+        else:
+            config = cls.getProfileConfig(profile)
+        if copy_from := config.get('copyFrom', None):
+            defaults = cls.getStateConfig(state, copy_from)
+        else:
+            defaults = cls.getStateClass(state).defaultConfig()
+        config = config.get(state, {})
+        return {
+            param: config.get(param, defaults.get(param, None))
+            for param in set(list(defaults.keys()) + list(config.keys()))
+        }
+
+    def setProfile(self, profile: str):
+        """Set the current patch profile."""
+        self._profile = profile
+        self.sigProfileChanged.emit(self, profile)
 
     def getState(self):
         """Return the currently active state.
         """
         return self.currentJob
-
-    def listStates(self):
-        return list(self.stateHandlers.keys())
-
-    def setStateConfig(self, config, profileName=None):
-        """Set configuration options to be used when initializing states.
-
-        Must be a dict like {'statename': {'opt': value}, ...}.
-        """
-        self.stateConfig = config
-        self.sigProfileChanged.emit(self, profileName)
 
     def stateChanged(self, oldState, newState):
         """Called when state has changed (possibly by user)
@@ -144,19 +153,18 @@ class PatchPipetteStateManager(Qt.QObject):
         self._sigStateChangeRequested.emit(state, returnQueue)
         try:
             success, ret = returnQueue.get(timeout=10)
-        except queue.Empty:
-            raise Exception("State change request timed out.")
+        except queue.Empty as e:
+            raise TimeoutError("State change request timed out.") from e
 
         if success:
             return ret
-        else:
-            sys.excepthook(*ret)
-            raise RuntimeError("Error requesting state change to %r; original exception appears above." % state)
+        sys.excepthook(*ret)
+        raise RuntimeError(f"Error requesting state change to {state!r}; original exception appears above.")
 
     def _stateChangeRequested(self, state, returnQueue):
         try:
             if state not in self.stateHandlers:
-                raise Exception("Unknown patch pipette state %r" % state)
+                raise ValueError(f"Unknown patch pipette state {state!r}")
             ret = (True, self.configureState(state))
         except Exception as exc:
             ret = (False, sys.exc_info())
@@ -170,7 +178,7 @@ class PatchPipetteStateManager(Qt.QObject):
             stateHandler = self.stateHandlers[state]
 
             # assemble state config from defaults and anything specified in args here
-            config = self.stateConfig.get(state, {}).copy()
+            config = self.getStateConfig(state, self._profile)
             config.update(kwds.pop('config', {}))
             kwds['config'] = config
 
@@ -179,7 +187,7 @@ class PatchPipetteStateManager(Qt.QObject):
             job.sigFinished.connect(self.jobFinished)
             oldState = None if oldJob is None else oldJob.stateName
             self.currentJob = job
-            self.dev._setState(state, oldState)
+            self.dev._setState(state, oldState)  # logging / accounting
             job.initialize()
             self.sigStateChanged.emit(self, job)
             return job
@@ -200,7 +208,7 @@ class PatchPipetteStateManager(Qt.QObject):
         else:
             self.stopJob()
             if self.dev.clampDevice is not None:
-                self.dev.enableTestPulse(False)
+                self.dev.clampDevice.enableTestPulse(False)
             if self.dev.pressureDevice is not None:
                 self.dev.pressureDevice.setPressure(source='atmosphere')
 
@@ -220,7 +228,7 @@ class PatchPipetteStateManager(Qt.QObject):
             try:
                 job.wait(timeout=10)
             except job.Timeout:
-                printExc("Timed out waiting for job %s to complete" % job)
+                printExc(f"Timed out waiting for job {job} to complete")
             except Exception:
                 # hopefully someone else is watching this future for errors!
                 pass
@@ -233,7 +241,7 @@ class PatchPipetteStateManager(Qt.QObject):
         try:
             job.cleanup()
         except Exception:
-            printExc("Error during %s cleanup:" % job.stateName)
+            printExc(f"Error during {job.stateName} cleanup:")
         disconnect(job.sigStateChanged, self.jobStateChanged)
         disconnect(job.sigFinished, self.jobFinished)
         if allowNextState and job.nextState is not None:
