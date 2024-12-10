@@ -5,13 +5,13 @@ import numpy as np
 import pyqtgraph as pg
 from acq4.Manager import getManager
 from acq4.devices.Device import Device
-from acq4.devices.OptomechDevice import OptomechDevice
+from acq4.devices.OptomechDevice import OptomechDevice, Geometry
 from acq4.devices.Stage import Stage
 from acq4.modules.Camera import CameraModuleInterface
 from acq4.util import Qt
 from acq4.util.Mutex import Mutex
 from acq4.util.debug import printExc
-from acq4.util.future import Future, MultiFuture, future_wrap
+from acq4.util.future import Future, MultiFuture, future_wrap, FutureButton
 from acq4.util.imaging import Frame
 from acq4.util.surface import find_surface
 from acq4.util.typing import Number
@@ -59,7 +59,7 @@ class Microscope(Device, OptomechDevice):
 
         self.objectives = collections.OrderedDict()
         ## Format of self.objectives is:
-        ## { 
+        ## {
         ##    switchPosition1: {objName1: objective1, objName2: objective, ...},
         ##    switchPosition2: {objName1: objective1, objName2: objective, ...},
         ## }
@@ -122,7 +122,7 @@ class Microscope(Device, OptomechDevice):
 
     def setObjectiveIndex(self, index):
         """Selects the objective currently in position *index*
-        
+
         This method is called when the user selects an objective index from the manager UI."""
         if self.switchDevice is not None and hasattr(self.switchDevice, 'setSwitch'):
             self.switchDevice.setSwitch(self.objSwitchId, int(index))
@@ -147,9 +147,11 @@ class Microscope(Device, OptomechDevice):
                 return
 
         self.setCurrentSubdevice(self.currentObjective)
+        self.geometry = self.currentObjective.hiddenGeometry
+        self.sigGeometryChanged.emit(self)
         self.sigObjectiveChanged.emit((self.currentObjective, lastObj))
 
-    def getObjective(self):
+    def getObjective(self) -> "Objective | None":
         """Return the currently active Objective."""
         with self.lock:
             if self.currentSwitchPosition not in self.selectedObjectives:
@@ -163,9 +165,7 @@ class Microscope(Device, OptomechDevice):
         with self.lock:
             return list(self.selectedObjectives.values())
 
-    def loadPreset(self):
-        btn = self.sender()
-        name = btn.objectName()
+    def loadPreset(self, name):
         conf = self.presets[name]
         for dev_name, state in conf.items():
             if dev_name == "objective":
@@ -175,10 +175,18 @@ class Microscope(Device, OptomechDevice):
                 if hasattr(dev, "loadPreset"):
                     dev.loadPreset(state)
 
+    def handlePresetHotkey(self, kb_dev, changes, name):
+        key, pressed = changes.get('keys', [])[0]
+        if pressed:
+            self.loadPreset(name)
+
     def deviceInterface(self, win):
         iface = ScopeGUI(self, win)
         iface.objectiveChanged((self.currentObjective, None))
         return iface
+
+    def physicalTransform(self, subdev=None):
+        return self.parentDevice().deviceTransform(subdev)
 
     def selectObjective(self, obj):
         ##Set the currently-active objective for a particular switch position
@@ -218,7 +226,7 @@ class Microscope(Device, OptomechDevice):
         # this is how much the focal plane needs to move (in the global frame)
         dif = z - self.getFocusDepth()
 
-        # this is the current global location of the focus device 
+        # this is the current global location of the focus device
         fd = self.focusDevice()
         fdpos = fd.globalPosition()
 
@@ -248,7 +256,7 @@ class Microscope(Device, OptomechDevice):
     def findSurfaceDepth(self, imager: "Device", searchDistance=200*µm, searchStep=5*µm, _future: Future = None) -> float:
         """Set the surface of the sample based on how focused the images are."""
         z_range = (self.getSurfaceDepth() + searchDistance, self.getSurfaceDepth() - searchDistance, searchStep)
-        z_stack: list[Frame] = self.getZStack(imager, z_range, block=True).getResult()
+        z_stack: list[Frame] = _future.waitFor(self.getZStack(imager, z_range, block=True)).getResult()
         threshold = self.config.get('surfaceDetectionPercentileThreshold', 96)
         if (idx := find_surface(z_stack, threshold)) is not None:
             depth = z_stack[idx].mapFromFrameToGlobal([0, 0, 0])[2]
@@ -336,7 +344,9 @@ class Microscope(Device, OptomechDevice):
         return self._positionDevice
 
 
-class Objective(OptomechDevice):
+class Objective(Device, OptomechDevice):
+
+    defaultGeometryArgs = {'color': (0, 0.7, 0.9, 0.4)}
 
     def __init__(self, config, scope, key):
         self._config = config
@@ -344,7 +354,10 @@ class Objective(OptomechDevice):
         self._key = key
         name = config['name']
 
-        OptomechDevice.__init__(self, scope.dm, {}, name)
+        Device.__init__(self, scope.dm, config, name)
+        OptomechDevice.__init__(self, scope.dm, config, name)
+        self.hiddenGeometry = self.geometry  # microscopes are in charge of setting the geometry
+        self.geometry = Geometry({}, {})
 
         if 'offset' in config:
             self.setOffset(config['offset'])
@@ -352,7 +365,7 @@ class Objective(OptomechDevice):
             self.setScale(config['scale'])
 
     def deviceTransform(self, subdev=None):
-        return pg.SRTTransform3D(OptomechDevice.deviceTransform(self))
+        return pg.SRTTransform3D(super().deviceTransform(subdev))
 
     def setOffset(self, pos):
         tr = self.deviceTransform()
@@ -443,14 +456,19 @@ class ScopeGUI(Qt.QWidget):
             btn = Qt.QPushButton(preset)
             btn.setObjectName(preset)
             self.ui.presetLayout.addWidget(btn)
-            btn.clicked.connect(dev.loadPreset)
+            btn.clicked.connect(self.loadPreset)
             # hotkeys
             if 'hotkey' in preset_conf:
                 hotkey = preset_conf['hotkey']
                 hotkey_dev = dev.dm.getDevice(hotkey["device"])
                 key = hotkey["key"]
-                hotkey_dev.addKeyCallback(key, dev.loadPreset, (preset,))
+                hotkey_dev.addKeyCallback(key, dev.handlePresetHotkey, (preset,))
         self.updateSpins()
+
+    def loadPreset(self):
+        btn = self.sender()
+        name = btn.objectName()
+        self.dev.loadPreset(name)
 
     def objectiveChanged(self, obj):
         ## Microscope says new objective has been selected; update selection radio
@@ -540,15 +558,15 @@ class ScopeCameraModInterface(CameraModuleInterface):
         self.movableFocusLine = self.plot.addLine(y=0, pen='y', markers=[('<|>', 0.5, 10)], movable=True)
 
         # Note: this is placed here because there is currently no better place.
-        # Ideally, the sample orientation, height, and anatomical identity would be contained 
+        # Ideally, the sample orientation, height, and anatomical identity would be contained
         # in a Sample or Slice object elsewhere..
         self.setSurfaceBtn = Qt.QPushButton('Set Surface')
         self.layout.addWidget(self.setSurfaceBtn, 0, 0)
         self.setSurfaceBtn.clicked.connect(self.setSurfaceClicked)
 
-        self.findSurfaceBtn = Qt.QPushButton('Find Surface')
+        self.findSurfaceBtn = FutureButton(
+            self.findSurface, 'Find Surface', stoppable=True, processing='Scanning...', failure='Failed!')
         self.layout.addWidget(self.findSurfaceBtn, 1, 0)
-        self.findSurfaceBtn.clicked.connect(self.findSurfaceClicked)
 
         self.depthLabel = pg.ValueLabel(suffix='m', siPrefix=True)
         self.layout.addWidget(self.depthLabel, 2, 0)
@@ -567,8 +585,8 @@ class ScopeCameraModInterface(CameraModuleInterface):
         self.getDevice().setSurfaceDepth(focus)
         self.transformChanged()
 
-    def findSurfaceClicked(self):
-        self.getDevice().findSurfaceDepth(self.getDevice().getDefaultImager())
+    def findSurface(self):
+        return self.getDevice().findSurfaceDepth(self.getDevice().getDefaultImager())
 
     def surfaceDepthChanged(self, depth):
         self.surfaceLine.setValue(depth)

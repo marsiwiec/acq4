@@ -1,9 +1,9 @@
 import contextlib
-
 import json
-import numpy as np
 import weakref
 from typing import List
+
+import numpy as np
 
 import pyqtgraph as pg
 from acq4 import getManager
@@ -80,6 +80,7 @@ class Pipette(Device, OptomechDevice):
     # May add items here to implement custom motion planning for all pipettes
     defaultMotionPlanners = defaultMotionPlanners()
     pathGeneratorClass = PipettePathGenerator
+    defaultGeometryArgs = {'color': (0, 1, 0.2, 1)}
 
     def __init__(self, deviceManager, config, name):
         Device.__init__(self, deviceManager, config, name)
@@ -98,7 +99,7 @@ class Pipette(Device, OptomechDevice):
         }
         parent = self.parentDevice()
         if not isinstance(parent, Stage):
-            raise Exception("Pipette device requires some type of translation stage as its parentDevice.")
+            raise Exception(f"Pipette device requires some type of translation stage as its parentDevice (got {parent}).")
 
         # may add items here to implement per-pipette custom motion planning
         self.motionPlanners = {}
@@ -450,7 +451,7 @@ class Pipette(Device, OptomechDevice):
 
     @future_wrap
     def stepwiseAdvance(self, depth: float, maxSpeed: float = 10e-6, interval: float = 5, _future=None):
-        """Retract in 1µm steps, allowing for manual user movements"""
+        """Retract/advance in 1µm steps, allowing for manual user movements"""
         initial_direction = None
         while True:
             pos = self.globalPosition()
@@ -477,7 +478,7 @@ class Pipette(Device, OptomechDevice):
             """pick a random point on a circle perpendicular to the pipette axis"""
             while np.linalg.norm(vec := np.cross(pipette_direction, np.random.uniform(-1, 1, size=3))) == 0:
                 pass  # prevent division by zero
-            return radius * vec / np.linalg.norm(vec)
+            return vec / np.linalg.norm(vec)
 
         pos = np.array(self.globalPosition())
         prev_dir = random_wiggle_direction()
@@ -489,7 +490,7 @@ class Pipette(Device, OptomechDevice):
                 while ptime.time() - start < duration:
                     while np.dot(direction := random_wiggle_direction(), prev_dir) > 0:
                         pass  # ensure different direction from previous
-                    _future.waitFor(self._moveToGlobal(pos=pos + direction, speed=speed))
+                    _future.waitFor(self._moveToGlobal(pos=pos + radius * direction, speed=speed))
                     prev_dir = direction
                 _future.waitFor(self._moveToGlobal(pos=pos, speed=speed))
 
@@ -673,7 +674,7 @@ class PipetteCamModInterface(CameraModuleInterface):
         mod.getDepthView().addItem(self.depthTarget)
         self.depthTarget.setVisible(False)
 
-        self.depthArrow = pg.ArrowItem(angle=-dev.pitchAngle())
+        self.depthArrow = pg.ArrowItem(angle=180 - dev.yawAngle())
         mod.getDepthView().addItem(self.depthArrow)
 
         # self.ui.setOrientationBtn.toggled.connect(self.setOrientationToggled)

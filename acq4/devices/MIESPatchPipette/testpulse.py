@@ -1,9 +1,8 @@
-from __future__ import print_function
-import time
+from acq4.devices.PatchPipette.testpulse import TestPulseThread
 from acq4.util import Qt
 
 
-class MIESTestPulseThread(Qt.QObject):
+class MIESTestPulseThread(TestPulseThread):
     """Run periodic test pulses over MIES bridge.
 
     Note: we do not actually start a thread here since the TP is run in the MIES process instead
@@ -13,15 +12,16 @@ class MIESTestPulseThread(Qt.QObject):
     finished = Qt.Signal()
 
     def __init__(self, dev, params):
-        Qt.QObject.__init__(self)
+        TestPulseThread.__init__(self, dev, params)
         self.dev = dev
         self._headstage = dev._headstage
         dev.mies.sigDataReady.connect(self.newTestPulse)
 
     def newTestPulse(self, data):
         """Got the signal from MIES that data is available, update"""
-        tp = TestPulse(self.dev, {}, data[:, self._headstage])
+        tp = TestPulse(self.dev, data[:, self._headstage])
 
+        # print(f"bms-debug: {tp}")
         self.sigTestPulseFinished.emit(self.dev, tp)
 
     def parseTPData(self, data):
@@ -40,17 +40,13 @@ class MIESTestPulseThread(Qt.QObject):
             TPData = {}
         return TPData
 
-    def setParameters(self, **kwds):
-        # what to do here? probably we don't support this for now.
-        pass
-
-    def getParameter(self, param):
-        return None
-
     def start(self):
         pass
 
     def stop(self, block=False):
+        pass
+
+    def run(self):
         pass
 
 
@@ -66,9 +62,10 @@ class TestPulse(object):
         self.result = {
             'startTime': data[0],
         }
-        self.analysis = {
+        self.analysis_l = {
             'steady_state_resistance': data[1],
             'peak_resistance': data[2],
+            'capacitance': 0,
         }
 
     @property
@@ -82,7 +79,9 @@ class TestPulse(object):
         return self.taskParams['clampMode']
 
     def analysis(self):
-        return self.analysis.copy()
+
+        # print(f"bms-debug: inside TestPulse (MIES)")
+        return self.analysis_l.copy()
 
     def getFitData(self):
         return None

@@ -36,7 +36,7 @@ class TestPulseThread(Thread):
             'autoBiasFollowRate': 0.5,
             'autoBiasMinCurrent': -1.5e-9,
             'autoBiasMaxCurrent': 1.5e9,
-            'autoBiasVCCarryover': 0.7,
+            'autoBiasVCCarryover': 1.0,
             'sampleRate': 500000,
             'downsample': 20,
             'vcPreDuration': 5e-3,
@@ -173,7 +173,7 @@ class TestPulseThread(Thread):
         mode = task.command[self._clampName]['mode']
         params = self.paramsForMode(mode)
         result: MetaArray = task.getResult()[self._clampName]
-        start_time = result.infoCopy()[2]['DAQ']['primary']['startTime']  # TODO what the shit is this
+        start_time = result._info[2]['DAQ']['primary']['startTime']
         pri = result['Channel': 'primary'].asarray()
         pulse_len = len(pri) // params['average']
 
@@ -259,7 +259,7 @@ class TestPulseThread(Thread):
 
     def updateAutoBias(self, tp: PatchClampTestPulse):
         analysis = tp.analysis
-        mode = tp.clamp_mode
+        mode = tp.recording.clamp_mode
         if mode.upper() == 'VC':
             # set ic holding from baseline current, multiplied by some factor for a little more added safety.
             self._clampDev.setHolding('IC', analysis['baseline_current'] * self._params['autoBiasVCCarryover'])

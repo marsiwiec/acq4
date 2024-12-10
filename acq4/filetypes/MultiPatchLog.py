@@ -9,8 +9,10 @@ import h5py
 import numpy as np
 
 import pyqtgraph as pg
+from pyqtgraph.units import GΩ, MΩ
 from acq4.filetypes.FileType import FileType
 from acq4.util import Qt
+from acq4.util.functions import plottable_booleans
 from acq4.util.target import Target
 from neuroanalysis.test_pulse import PatchClampTestPulse
 from neuroanalysis.test_pulse_stack import H5BackedTestPulseStack
@@ -245,8 +247,8 @@ class MultiPatchLogData(object):
                         # TODO only open the file once, not once per device
                         h5_file = h5py.File(h5_fn, 'r')
                         # TODO find a way to stop duplicating the "test_pulses/{dev}" part
-                        dataset = h5_file[f"test_pulses/{dev}"]
-                        stack = H5BackedTestPulseStack(dataset)
+                        data_group = h5_file[f"test_pulses/{dev}"]
+                        stack = H5BackedTestPulseStack(data_group)
                         if dev in self.fullTestPulseStacks:
                             self.fullTestPulseStacks[dev].merge(stack)
                         else:
@@ -486,13 +488,6 @@ class PipetteStateRegion(pg.LinearRegionItem):
             super().mouseDoubleClickEvent(ev)
 
 
-def plottable_booleans(data) -> np.ndarray:
-    data = data.astype(float)
-    data[data < 1] = np.nan
-    data -= 1
-    return data
-
-
 class MultiPatchLogWidget(Qt.QWidget):
     # TODO selectable event types to display?
     # TODO display video files
@@ -518,10 +513,6 @@ class MultiPatchLogWidget(Qt.QWidget):
         self._frames = []
         self._current_time = 0
         self._pinned_image_z = -10000
-        self._detection_τ = 5
-        self._repair_τ = 10
-        self._stretch_threshold = 0.005
-        self._tear_threshold = -0.00128
         layout = Qt.QGridLayout()
         self.setLayout(layout)
         self._plots_widget = pg.GraphicsLayoutWidget()
@@ -530,6 +521,7 @@ class MultiPatchLogWidget(Qt.QWidget):
         self._visual_field = self._plots_widget.addPlot()
         self._visual_field.setAspectLocked(ratio=1.0001)  # workaround weird bug with qt
         self._full_test_pulse_plot = None
+        self._test_pulse_label = None
         self._plots_by_units: dict[str, pg.PlotItem] = {}
         self._regions_by_plot: dict[pg.PlotItem, list[PipetteStateRegion]] = {}
         self._status_by_plot: dict[pg.PlotItem, list[pg.InfiniteLine]] = {}
@@ -648,9 +640,15 @@ class MultiPatchLogWidget(Qt.QWidget):
         self._displayPressure = Qt.QCheckBox('Pressure')
         self._displayPressure.toggled.connect(self._togglePressurePlot)
         self._ctrl_layout.addWidget(self._displayPressure)
+        self._sealAnalysisItems = {}
+        self._displaySealAnalysis = Qt.QCheckBox('Seal Analysis')
+        self._displaySealAnalysis.toggled.connect(self._toggleSealAnalysis)
+        self._ctrl_layout.addWidget(self._displaySealAnalysis)
+        self._resealAnalysisItems = {}
         self._displayResealAnalysis = Qt.QCheckBox('Reseal Analysis')
         self._displayResealAnalysis.toggled.connect(self._toggleResealAnalysis)
         self._ctrl_layout.addWidget(self._displayResealAnalysis)
+        self._detectAnalysisItems = {}
         self._displayDetectAnalysis = Qt.QCheckBox('Cell Detect Analysis')
         self._displayDetectAnalysis.toggled.connect(self._toggleDetectAnalysis)
         self._ctrl_layout.addWidget(self._displayDetectAnalysis)
@@ -712,30 +710,62 @@ class MultiPatchLogWidget(Qt.QWidget):
         elif 'Pa' in self._plots_by_units:
             self._plots_by_units['Pa'].hide()
 
+    def _toggleAnalysis(self, cls, analysisItems: dict, state: bool, *args, **kwargs):
+        if state:
+            for units, items in cls.plot_items(*args, **kwargs).items():
+                plot = self.buildPlotForUnits(units)
+                analysisItems.setdefault(units, []).extend(items)
+                for item in items:
+                    plot.addItem(item)
+            measurements = self.testPulseAnalysisDataByState('steady_state_resistance')
+            for units, plots in cls.plots_for_data(measurements, *args, **kwargs).items():
+                plot = self.buildPlotForUnits(units)
+                analysisItems.setdefault(units, [])
+                for p in plots:
+                    analysisItems[units].append(plot.plot(**p))
+        else:
+            for units, items in analysisItems.items():
+                plot = self._plots_by_units.get(units)
+                if plot is not None:
+                    for item in items:
+                        plot.removeItem(item)
+            analysisItems.clear()
+
+    def _toggleSealAnalysis(self, state: bool):
+        from acq4.devices.PatchPipette.states import SealAnalysis
+
+        # TODO get the current patch profile params
+        self._toggleAnalysis(SealAnalysis, self._sealAnalysisItems, state, tau=5, success_at=1*GΩ, hold_at=100*MΩ)
+
     def _toggleResealAnalysis(self, state: bool):
         from acq4.devices.PatchPipette.states import ResealAnalysis
 
-        if state:
-            resistance_plot = self.buildPlotForUnits('Ω')
-            analysis_plot = self.buildPlotForUnits('')
-            analysis_plot.addItem(pg.InfiniteLine(
-                movable=False, pos=self._stretch_threshold, angle=0, pen=pg.mkPen('w')))
-            analysis_plot.addItem(pg.InfiniteLine(
-                movable=False, pos=self._tear_threshold, angle=0, pen=pg.mkPen('w')))
-            names = False
-            for ssr in self.testPulseAnalysisDataByState('steady_state_resistance'):
-                analyzer = ResealAnalysis(
-                    self._stretch_threshold, self._tear_threshold, self._detection_τ, self._repair_τ)
-                analysis = analyzer.process_measurements(ssr)
-                analysis_plot.plot(analysis["time"], analysis["detect_ratio"], pen=pg.mkPen('b'), name=None if names else 'Detect Ratio')
-                resistance_plot.plot(analysis["time"], analysis["detect_avg"], pen=pg.mkPen('b'), name=None if names else 'Detect Avg')
-                analysis_plot.plot(analysis["time"], analysis["repair_ratio"], pen=pg.mkPen(90, 140, 255), name=None if names else 'Repair Ratio')
-                resistance_plot.plot(analysis["time"], analysis["repair_avg"], pen=pg.mkPen(90, 140, 255), name=None if names else 'Repair Avg')
-                analysis_plot.plot(
-                    analysis["time"], plottable_booleans(analysis["stretching"]), pen=pg.mkPen('y'), symbol='x', name=None if names else 'Stretching')
-                analysis_plot.plot(
-                    analysis["time"], plottable_booleans(analysis["tearing"]), pen=pg.mkPen('r'), symbol='o', name=None if names else 'Tearing')
-                names = True
+        # TODO get the current patch profile params
+        self._toggleAnalysis(
+            ResealAnalysis,
+            self._resealAnalysisItems,
+            state,
+            stretch_threshold=0.005,
+            tear_threshold=-0.00128,
+            detection_tau=5,
+            repair_tau=10,
+        )
+
+    def _toggleDetectAnalysis(self, state: bool):
+        from acq4.devices.PatchPipette.states import CellDetectAnalysis
+
+        # TODO get the current patch profile params
+        self._toggleAnalysis(
+            CellDetectAnalysis,
+            self._detectAnalysisItems,
+            state,
+            baseline_tau=20,
+            cell_threshold_fast=1e6,
+            cell_threshold_slow=200e3,
+            slow_detection_steps=3,
+            obstacle_threshold=1e6,
+            break_threshold=-1e6,
+        )
 
     def testPulseAnalysisDataByState(self, field: str):
         for data in self._devices.values():
@@ -756,58 +786,49 @@ class MultiPatchLogWidget(Qt.QWidget):
                         continue
                     yield measurements[start:end]
 
-    def _toggleDetectAnalysis(self, state: bool):
-        from acq4.devices.PatchPipette.states import CellDetectAnalysis
-
-        if state:
-            resistance_plot = self.buildPlotForUnits('Ω')
-            analysis_plot = self.buildPlotForUnits('')
-            legend_has_names = False
-            for ssr_chunk in self.testPulseAnalysisDataByState('steady_state_resistance'):
-                analyzer = CellDetectAnalysis(
-                    cell_threshold_fast=1e6,
-                    cell_threshold_slow=200e3,
-                    slow_detection_steps=3,
-                    obstacle_threshold=1e6,
-                    break_threshold=-1e6,
-                )
-                analysis = analyzer.process_measurements(ssr_chunk)
-                resistance_plot.plot(
-                    analysis["time"],
-                    analysis["resistance_avg"],
-                    pen=pg.mkPen('b'),
-                    name=None if legend_has_names else 'Resistance Avg',
-                )
-                analysis_plot.plot(
-                    analysis["time"],
-                    plottable_booleans(analysis["obstacle_detected"]),
-                    pen=pg.mkPen('r'),
-                    symbol='x',
-                    name=None if legend_has_names else 'Obstacle Detected',
-                )
-                legend_has_names = True
-
     def _toggleFullTestPulse(self, state: bool):
         if state:
+            # hint: to save a test pulse for use in e.g. unit tests:
+            #    import h5py
+            #    from neuroanalysis.test_pulse_stack import H5BackedTestPulseStack
+            #
+            #    widget = man.getModule("Data Manager").ui.dataViewWidget._multiPatchLogWidget
+            #    tp = widget.testPulsesAtTime(SOMETIME)['PatchPipette1']
+            #    f = h5py.File("/WHEREVER/THIS/IS/neuroanalysis/test_data/TP_NAME.h5", "a")
+            #    gr = f.create_group("test_pulses")
+            #    tps = H5BackedTestPulseStack(gr)
+            #    tps.append(tp)
+            #    f.close()
+            #    del(tps)
+            #    del(gr)
+
             self._full_test_pulse_plot = self._plots_widget.addPlot(
                 name="Test Pulse",
+                title='Test Pulse',
                 labels=dict(bottom=('time', 's'), left=('', 'V')),
                 row=1,
                 col=0,
             )
+            self._full_test_pulse_plot.addLegend()
             self._displayTestPulseDataAtTime(self._current_time)
         else:
             self._plots_widget.removeItem(self._full_test_pulse_plot)
             self._full_test_pulse_plot = None
 
     def _displayTestPulseDataAtTime(self, when):
-        if self._full_test_pulse_plot is None:
+        plot = self._full_test_pulse_plot
+        if plot is None:
             return
-        self._full_test_pulse_plot.clear()
+        plot.clear()
+        if self._test_pulse_label is not None:
+            plot.vb.removeItem(self._test_pulse_label)
+            self._test_pulse_label = None
+
         if tps := self.testPulsesAtTime(when):
             tp = list(tps.values())[0]  # todo separate plots for each device
-            self._full_test_pulse_plot.setLabel('left', tp.plot_title, tp.plot_units)
-            self._full_test_pulse_plot.plot(tp['primary'].time_values, tp['primary'].data, name="raw")
+            tp.plot(plot, label=False)
+            self._test_pulse_label = tp.label_for_plot(plot)
+            plot.setLabel('left', tp.plot_title, tp.plot_units)
 
     def testPulsesAtTime(self, when) -> dict[str, PatchClampTestPulse]:
         abs_when = when + self.startTime()
