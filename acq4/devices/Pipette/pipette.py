@@ -17,7 +17,7 @@ from acq4.util.future import future_wrap
 from acq4.util.target import Target
 from pyqtgraph import Point
 from .planners import defaultMotionPlanners, PipettePathGenerator
-from .tracker import PipetteTracker
+from .tracker import ResnetPipetteTracker
 from ..RecordingChamber import RecordingChamber
 
 CamModTemplate = Qt.importTemplate('.cameraModTemplate')
@@ -129,7 +129,7 @@ class Pipette(Device, OptomechDevice):
 
         self._updateTransform()
 
-        self.tracker = PipetteTracker(self)
+        self.tracker = ResnetPipetteTracker(self)
         deviceManager.declareInterface(name, ['pipette'], self)
 
         target = self.readConfigFile('target').get('targetGlobalPosition', None)
@@ -160,7 +160,7 @@ class Pipette(Device, OptomechDevice):
         self.currentMotionPlanner = plannerClass(self, position, speed, **kwds)
         future = self.currentMotionPlanner.move()
         if raiseErrors is not False:
-            future.raiseErrors(message=f"Move to {position} position failed; requested from:\n{{stack}}")
+            future.raiseErrors(message=f"Move to {position} position failed ({{error}}); requested from:\n{{stack}}")
 
         return future
 
@@ -546,14 +546,14 @@ class Pipette(Device, OptomechDevice):
         pos = self.globalPosition()
         future = self.scopeDevice().setGlobalPosition(pos, speed=speed)
         if raiseErrors:
-            future.raiseErrors("Focus on pipette tip failed; requested from:\n{stack})")
+            future.raiseErrors("Focus on pipette tip failed ({error}); requested from:\n{stack})")
         return future
 
     def focusTarget(self, speed='fast', raiseErrors=False):
         pos = self.targetPosition()
         future = self.scopeDevice().setGlobalPosition(pos, speed=speed)
         if raiseErrors:
-            future.raiseErrors("Focus on pipette target failed; requested from:\n{stack})")
+            future.raiseErrors("Focus on pipette target failed ({error}); requested from:\n{stack})")
         return future
 
     def positionChanged(self):
@@ -578,6 +578,12 @@ class Pipette(Device, OptomechDevice):
         """Return an object that records all motion updates from this pipette
         """
         return PipetteRecorder(self)
+    
+    def findNewPipette(self):
+        from acq4.devices.Pipette.calibration import calibratePipette
+        future = calibratePipette(self, self.imagingDevice(), self.scopeDevice())
+        self._last_calibration_future = future  # keep for easy debugging of calibration algorithm
+        return future
 
 
 class PipetteRecorder:
