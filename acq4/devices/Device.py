@@ -62,7 +62,7 @@ class Device(InterfaceMixin, Qt.QObject):  # QObject calls super, which is disas
 
         This path should resolve to `acq4/config/devices/DeviceName_config`.
         """
-        return os.path.join('devices', self.name() + '_config')
+        return os.path.join('devices', f'{self.name()}_config')
 
     def configFileName(self, filename):
         """Return the full path to a config file for this device.
@@ -107,10 +107,11 @@ class Device(InterfaceMixin, Qt.QObject):  # QObject calls super, which is disas
         if block:
             l = self._lock_.tryLock(int(timeout*1000))
             if not l:
-                print("Timeout waiting for device lock for %s" % self.name())
+                print(f"Timeout waiting for device lock for {self.name()}")
                 print("  Device is currently locked from:")
                 print(self._lock_tb_)
-                raise Exception("Timed out waiting for device lock for %s\n  Locking traceback:\n%s" % (self.name(), self._lock_tb_))
+                raise TimeoutError(
+                    f"Timed out waiting for device lock for {self.name()}\n  Locking traceback:\n{self._lock_tb_}")
         else:
             l = self._lock_.tryLock()
             if not l:

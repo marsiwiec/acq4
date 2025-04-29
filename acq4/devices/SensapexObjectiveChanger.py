@@ -17,7 +17,7 @@ class SensapexObjectiveChanger(Device):
 
         address = config.pop('address', None)
         group = config.pop('group', None)
-        ump = UMP.get_ump(address=address, group=group)
+        ump = UMP.get_ump(address=address, group=group, handle_atexit=False)
         self.dev = ump.get_device(config.get('deviceId'))
 
         self._lastPos = None
@@ -94,7 +94,7 @@ class ObjectiveChangeFuture(Future):
                     self._start = ptime.time()
                     dev.dev.set_lens_position(target)
             try:
-                self.checkStop(delay=0.2)
+                self.sleep(0.2)
             except self.StopRequested:
                 self._taskDone(interrupted=True, error="Stop requested before operation finished.")
                 break
