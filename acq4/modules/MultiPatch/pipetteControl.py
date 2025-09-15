@@ -118,7 +118,8 @@ class PipetteControl(Qt.QWidget):
             PlotWidget(mode='test pulse'), 
             PlotWidget(mode='ss resistance')
         ]
-        for plt in self.plots:
+        for i, plt in enumerate(self.plots):
+            plt.plot.setObjectName(f"MultiPatch_{pipette.name()}_plot{i+1}")
             self.ui.plotLayout.addWidget(plt)
             plt.sigModeChanged.connect(self.plotModeChanged)
 
@@ -130,7 +131,8 @@ class PipetteControl(Qt.QWidget):
             self.pip.clampDevice.sigStateChanged.connect(self.clampStateChanged)
             self.pip.clampDevice.sigHoldingChanged.connect(self.clampHoldingChanged)
             self.clampStateChanged(self.pip.clampDevice.getState())
-            self.clampHoldingChanged(self.pip.clampDevice, self.pip.clampDevice.getMode())
+            self.clampHoldingChanged(self.pip.clampDevice.getMode(), 
+                                     self.pip.clampDevice.getHolding(self.pip.clampDevice.getMode()))
             self._updateAutoBiasUi()
             self._updateActiveHoldingUi()
 
@@ -406,7 +408,8 @@ class PlotWidget(Qt.QWidget):
             self._analysisLabel = None
         if self.mode == 'test pulse':
             self.plot.clear()
-            self._plotTestPulse(tp)
+            if tp is not None:
+                self._plotTestPulse(tp)
         elif self.mode == 'tp analysis':
             self.plot.clear()
             tp.plot(self.plot, label=False)
